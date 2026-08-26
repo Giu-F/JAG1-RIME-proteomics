@@ -1,0 +1,268 @@
+---
+title: "JAG1 Peptide Mapping and ICD Enrichment"
+author: "Giulia Franciosa"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+This analysis evaluates the peptide-level evidence for enrichment of the **Jagged-1 intracellular domain (JAG1-ICD)** in the RIME-DIA experiment.
+
+Peptides assigned to JAG1 are classified according to whether their stripped peptide sequence maps within the JAG1 intracellular-domain sequence. The analysis compares the number and MS2 signal contribution of ICD-derived and non-ICD peptides and examines their abundance distributions.
+
+The required Spectronaut peptide-level report is not stored in this GitHub repository. To reproduce the analysis, download the corresponding report from the PRIDE dataset and place it in the local `data/` directory.
+
+# Setup
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(here)
+
+data_dir <- here("data")
+plots_dir <- here("plots")
+
+input_file <- file.path(
+  data_dir,
+  "20251113_134101_20220819_Report.tsv"
+)
+```
+
+# 1. Load peptide-level Spectronaut data
+
+The Spectronaut report is filtered to retain only peptide entries assigned to **JAG1**.
+
+```{r load-data}
+data <- fread(input_file) %>%
+  as.data.frame()
+
+data_jagged1 <- data %>%
+  filter(PG.Genes == "JAG1")
+```
+
+# 2. Simplify run names
+
+Run names are shortened to retain only the experimental group and replicate identifier.
+
+```{r rename-runs}
+data_jagged1 <- data_jagged1 %>%
+  mutate(
+    R.FileName = R.FileName %>%
+      str_remove("^.*HPAF_") %>%
+      str_replace("Sample15|Sample17", "R1") %>%
+      str_replace("Sample16|Sample18", "R2") %>%
+      str_replace("Sample21|Sample23", "R3") %>%
+      str_replace("Sample22|Sample24", "R4")
+  )
+
+
+glimpse(data_jagged1)
+```
+
+# 3. Classify peptides as ICD or non-ICD
+
+The amino-acid sequence of the JAG1 intracellular domain used in the analysis is defined below. Each JAG1 peptide is classified according to whether its stripped peptide sequence occurs within this sequence.
+
+```{r classify-peptides}
+jag1_icd_sequence <- paste0(
+  "RKRRKPGSHTHSASEDNTTNNVREQLNQIKNPIEKHGANTVPIKDYENKNSKMSKIRTHNSEV",
+  "EEDDMDKHQQKARFAKQPAYTLVDREEKPPNGTPTKHPNWTNKQDNRDLESAQSLNRMEYIV"
+)
+
+data_jagged1 <- data_jagged1 %>%
+  mutate(
+    ic = if_else(
+      str_detect(jag1_icd_sequence, fixed(PEP.StrippedSequence)),
+      "ICD",
+      "non-ICD"
+    )
+  )
+
+cat("Number of peptide observations:\n")
+table(data_jagged1$ic)
+
+cat("\nProportion of peptide observations:\n")
+prop.table(table(data_jagged1$ic))
+```
+
+# 4. Overall peptide distribution
+
+The relative number of peptide observations mapping to the ICD and non-ICD regions is summarized below.
+
+```{r peptide-count-overall, fig.width=6, fig.height=5}
+peptide_counts <- data_jagged1 %>%
+  count(ic, name = "n")
+
+p_peptide_count <- ggplot(
+  peptide_counts,
+  aes(x = "", y = n, fill = ic)
+) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = n),
+    position = position_stack(vjust = 0.5),
+    color = "white"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Peptide region"
+  ) +
+  theme_void()
+
+p_peptide_count
+
+ggsave(
+  file.path(plots_dir, "JAG1_peptide_count_ICD_vs_nonICD.png"),
+  p_peptide_count,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+# 5. Peptide distribution by run
+
+The number of ICD and non-ICD peptide observations is shown for each MS run.
+
+```{r peptide-count-run, fig.width=8, fig.height=5}
+peptide_counts_run <- data_jagged1 %>%
+  count(R.FileName, ic, name = "n")
+
+p_peptide_run <- ggplot(
+  peptide_counts_run,
+  aes(x = R.FileName, y = n, fill = ic)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3
+  ) +
+  labs(
+    x = "MS run",
+    y = "Number of peptide observations",
+    fill = "Peptide region"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+p_peptide_run
+
+ggsave(
+  file.path(plots_dir, "JAG1_peptide_count_by_run.png"),
+  p_peptide_run,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+# 6. Contribution to total JAG1 MS2 signal
+
+The MS2 quantities of all JAG1 peptide observations are summed separately for ICD and non-ICD peptides. This estimates the relative contribution of each region to the total JAG1 peptide signal.
+
+```{r ms2-signal, fig.width=6, fig.height=5}
+signal_summary <- data_jagged1 %>%
+  group_by(ic) %>%
+  summarise(
+    summed_MS2 = sum(PEP.MS2Quantity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fraction = summed_MS2 / sum(summed_MS2)
+  )
+
+signal_summary
+```
+
+```{r ms2-signal-plot, fig.width=6, fig.height=5}
+p_signal <- ggplot(
+  signal_summary,
+  aes(x = "", y = summed_MS2, fill = ic)
+) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = scales::percent(fraction, accuracy = 1)),
+    position = position_stack(vjust = 0.5),
+    color = "white"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Peptide region"
+  ) +
+  theme_void()
+
+p_signal
+
+ggsave(
+  file.path(plots_dir, "JAG1_MS2_signal_ICD_vs_nonICD.png"),
+  p_signal,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+# 7. Peptide-level intensity distribution
+
+Because the same peptide sequence can be observed across multiple runs, a single representative intensity is calculated for each unique stripped peptide sequence using the median MS2 quantity across observations.
+
+```{r peptide-median}
+data_jagged1_median <- data_jagged1 %>%
+  group_by(PEP.StrippedSequence) %>%
+  summarise(
+    median_MS2 = median(PEP.MS2Quantity, na.rm = TRUE),
+    ic = first(ic),
+    .groups = "drop"
+  )
+```
+
+```{r peptide-intensity-plot, fig.width=6, fig.height=5}
+p_intensity <- ggplot(
+  data_jagged1_median,
+  aes(x = ic, y = median_MS2)
+) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(
+    width = 0.12,
+    outlier.shape = NA
+  ) +
+  scale_y_log10(
+    labels = scales::comma
+  ) +
+  labs(
+    x = NULL,
+    y = "Median peptide MS2 quantity"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_intensity
+
+ggsave(
+  file.path(plots_dir, "JAG1_peptide_median_MS2_intensity.png"),
+  p_intensity,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
