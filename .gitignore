@@ -1,0 +1,27 @@
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Quarto
+.quarto/
+*_files/
+*_cache/
+
+# Input data
+data/*
+!data/HPA_subcellular_experimental_2025.tsv
+!data/HPA_subcellular_predicted_2025.tsv
+
+# Analysis outputs
+results/*
+plots/*
+analysis/*.html
+
+# OS files
+.DS_Store
+Thumbs.db
+.Rproj.user
+.httr-oauth
+.quarto

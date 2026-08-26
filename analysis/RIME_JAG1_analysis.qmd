@@ -1,0 +1,780 @@
+---
+title: "JAG1-ICD RIME-DIA Proteomics Analysis"
+author:
+  - "Giulia Franciosa"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+This analysis processes the Spectronaut protein-group output from the JAG1 intracellular-domain (JAG1-ICD) RIME-DIA experiment in HPAF-II cells. Two independent JAG1-ICD antibodies (Sigma and Thermo Fisher) are compared with an IgG control.
+
+The workflow includes:
+
+1. data import and cleaning;
+2. quality-control plots;
+3. iBAQ-based JAG1 abundance ranking;
+4. protein filtering;
+5. missing-value imputation;
+6. median-centering normalization;
+7. principal component analysis;
+8. differential enrichment analysis with `limma`;
+9. Fisher combination of the two antibody-specific p-values;
+10. volcano plots, heatmap, and selected protein plots.
+
+All paths are relative to the R project. Raw/input tables belong in `data/`, processed result tables in `results/`, and figures in `plots/`.
+
+# Setup
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(imp4p)
+library(imputeLCMD)
+library(DAPAR)
+library(limma)
+library(Tmisc)
+library(ggrepel)
+library(pheatmap)
+library(here)
+
+data_dir <- here("data")
+results_dir <- here("results")
+plots_dir <- here("plots")
+
+input_file <- file.path(
+  data_dir,
+  "Rime_J1_HPAF_SN19_Report_Log2_Protein_Quant_GF_Pivot.tsv"
+)
+
+stopifnot(file.exists(input_file))
+```
+
+# Helper functions
+
+```{r helper-functions}
+make_long <- function(df) {
+  sample_cols <- grep("^(IgG|S|TF)_R[1-4]$", names(df), value = TRUE)
+
+  df %>%
+    select(PG.ProteinGroups, PG.Genes, all_of(sample_cols)) %>%
+    pivot_longer(
+      cols = all_of(sample_cols),
+      names_to = "run",
+      values_to = "value"
+    ) %>%
+    mutate(
+      group = str_remove(run, "_R.*$"),
+      replicate = str_extract(run, "R[1-4]$")
+    )
+}
+
+make_qc_plots <- function(df, stage) {
+  long <- make_long(df)
+
+  ids <- long %>%
+    group_by(run, group, replicate) %>%
+    summarise(Number_of_IDs = sum(!is.na(value)), .groups = "drop")
+
+  p_ids <- ggplot(ids, aes(group, Number_of_IDs, fill = replicate)) +
+    geom_col(position = "dodge") +
+    geom_text(
+      aes(label = Number_of_IDs),
+      position = position_dodge(width = 0.9),
+      vjust = -0.4,
+      size = 3
+    ) +
+    labs(
+      x = NULL,
+      y = paste("Number of protein groups identified", stage)
+    ) +
+    theme_minimal(base_size = 12)
+
+  p_hist <- long %>%
+    filter(!is.na(value)) %>%
+    ggplot(aes(value, colour = group)) +
+    geom_histogram(bins = 40, fill = "white") +
+    facet_wrap(~run) +
+    labs(x = "Log2 MS signal", y = "Count") +
+    theme_minimal(base_size = 10)
+
+  p_density <- long %>%
+    filter(!is.na(value)) %>%
+    ggplot(aes(value, colour = group)) +
+    geom_density() +
+    labs(x = "Log2 MS signal", y = "Density") +
+    theme_minimal(base_size = 12)
+
+  p_box <- long %>%
+    filter(!is.na(value)) %>%
+    ggplot(aes(run, value, fill = group)) +
+    geom_boxplot(outlier.size = 0.5) +
+    labs(x = "MS run", y = "Log2 MS signal") +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+  stage_name <- str_replace_all(str_trim(stage), "[^A-Za-z0-9]+", "_")
+  stage_name <- str_remove_all(stage_name, "^_|_$")
+
+  ggsave(
+    file.path(plots_dir, paste0("QC_IDs_", stage_name, ".png")),
+    p_ids, width = 6, height = 5, dpi = 300
+  )
+  ggsave(
+    file.path(plots_dir, paste0("QC_histogram_", stage_name, ".png")),
+    p_hist, width = 10, height = 7, dpi = 300
+  )
+  ggsave(
+    file.path(plots_dir, paste0("QC_density_", stage_name, ".png")),
+    p_density, width = 6, height = 5, dpi = 300
+  )
+  ggsave(
+    file.path(plots_dir, paste0("QC_boxplot_", stage_name, ".png")),
+    p_box, width = 8, height = 5, dpi = 300
+  )
+
+  list(
+    ids = p_ids,
+    histogram = p_hist,
+    density = p_density,
+    boxplot = p_box
+  )
+}
+
+plot_target <- function(df, gene) {
+  plot_data <- make_long(df) %>%
+    filter(PG.Genes == gene, !is.na(value))
+
+  ggplot(plot_data, aes(group, value, colour = group, shape = group)) +
+    geom_point(
+      size = 2.5,
+      position = position_jitter(width = 0.12, height = 0)
+    ) +
+    stat_summary(
+      fun = mean,
+      geom = "crossbar",
+      width = 0.4,
+      colour = "black"
+    ) +
+    labs(
+      title = gene,
+      x = NULL,
+      y = "Normalized log2 MS signal"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "none"
+    )
+}
+```
+
+# 1. Load and clean the Spectronaut output
+
+Only entries from the human reference-proteome FASTA are retained. Contaminants and entries without a gene name are removed. Sample names are shortened to antibody/control and replicate identifiers.
+
+```{r load-clean}
+data <- fread(input_file, na.strings = c("NaN", "NA")) %>%
+  as.data.frame()
+
+data <- data %>%
+  filter(
+    PG.FastaFiles == "J1_UP000005640_9606",
+    !is.na(PG.Genes),
+    PG.Genes != ""
+  ) %>%
+  select(-PG.FastaFiles)
+
+clean_sample_names <- function(x) {
+  x %>%
+    str_remove("\\.raw.*$") %>%
+    str_replace("_-_", "_IgG_") %>%
+    str_remove("^.*HPAF_") %>%
+    str_replace("Sample13|Sample15|Sample17", "R1") %>%
+    str_replace("Sample14|Sample16|Sample18", "R2") %>%
+    str_replace("Sample19|Sample21|Sample23", "R3") %>%
+    str_replace("Sample20|Sample22|Sample24", "R4")
+}
+
+names(data) <- clean_sample_names(names(data))
+
+write.table(
+  data,
+  file.path(results_dir, "data_cleaned.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+glimpse(data)
+```
+
+# 2. Separate protein-group quantities and iBAQ values
+
+Protein-group log2 quantities are used for the differential enrichment analysis. iBAQ values are retained separately for abundance ranking.
+
+```{r separate-quantities}
+lfq_cols <- grep("\\.PG\\.Log2Quantity$", names(data), value = TRUE)
+ibaq_cols <- grep("\\.PG\\.IBAQ$", names(data), value = TRUE)
+metadata_cols <- setdiff(names(data), c(lfq_cols, ibaq_cols))
+
+dat <- data %>%
+  select(all_of(metadata_cols), all_of(lfq_cols)) %>%
+  rename_with(
+    ~ str_remove(.x, fixed(".PG.Log2Quantity")),
+    all_of(lfq_cols)
+  )
+glimpse(dat)
+
+ibaq <- data %>%
+  select(all_of(metadata_cols), all_of(ibaq_cols)) %>%
+  rename_with(
+    ~ str_remove(.x, fixed(".PG.IBAQ")),
+    all_of(ibaq_cols)
+  )
+
+sample_cols <- grep("^(IgG|S|TF)_R[1-4]$", names(dat), value = TRUE)
+
+# Spectronaut can report multiple iBAQ values separated by semicolons.
+# We use the first value for each protein group.
+ibaq[sample_cols] <- lapply(
+  ibaq[sample_cols],
+  function(x) as.numeric(str_remove(as.character(x), ";.*$"))
+)
+
+ibaq[sample_cols] <- lapply(ibaq[sample_cols], log2)
+ibaq[sample_cols] <- lapply(
+  ibaq[sample_cols],
+  function(x) replace(x, !is.finite(x), NA_real_)
+)
+glimpse(ibaq)
+
+write.table(
+  dat,
+  file.path(results_dir, "PG_data_cleaned.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  ibaq,
+  file.path(results_dir, "iBAQ_data_cleaned.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# 3. Initial quality control
+
+```{r qc-raw, fig.width=8, fig.height=5}
+qc_raw <- make_qc_plots(dat, "before filtering")
+
+qc_raw$ids
+qc_raw$density
+qc_raw$boxplot
+```
+
+# 4. JAG1 iBAQ abundance ranking
+
+JAG1 abundance is ranked independently within the Sigma (`S`) and Thermo Fisher (`TF`) immunoprecipitations.
+
+```{r ibaq-ranking}
+#| warning: false
+#| message: false
+
+rank_ibaq <- function(df, prefix) {
+  cols <- grep(paste0("^", prefix, "_R[1-4]$"), names(df), value = TRUE)
+
+  out <- df %>%
+    transmute(
+      PG.Genes,
+      mean_iBAQ = rowMeans(across(all_of(cols)), na.rm = TRUE)
+    ) %>%
+    mutate(
+      mean_iBAQ = replace(mean_iBAQ, is.nan(mean_iBAQ), NA_real_),
+      rank = rank(-mean_iBAQ, na.last = "keep"),
+      rank_gene = paste(PG.Genes, rank, sep = " - ")
+    )
+
+  out
+}
+
+rank_S <- rank_ibaq(ibaq, "S")
+rank_TF <- rank_ibaq(ibaq, "TF")
+
+plot_rank <- function(rank_df, title) {
+  jag1_rank <- filter(rank_df, PG.Genes == "JAG1")
+
+  ggplot(rank_df, aes(rank, mean_iBAQ)) +
+    geom_point(alpha = 0.6) +
+    geom_point(data = jag1_rank, size = 2.5) +
+    geom_label_repel(
+      data = jag1_rank,
+      aes(label = rank_gene),
+      max.overlaps = Inf
+    ) +
+    labs(
+      title = title,
+      x = "Protein rank",
+      y = "Mean log2 iBAQ"
+    ) +
+    theme_light(base_size = 12)
+}
+
+p_rank_S <- plot_rank(rank_S, "Sigma IP")
+p_rank_TF <- plot_rank(rank_TF, "Thermo Fisher IP")
+
+p_rank_S
+p_rank_TF
+
+ggsave(
+  file.path(plots_dir, "JAG1_iBAQ_rank_Sigma.png"),
+  p_rank_S, width = 6, height = 5, dpi = 300
+)
+ggsave(
+  file.path(plots_dir, "JAG1_iBAQ_rank_ThermoFisher.png"),
+  p_rank_TF, width = 6, height = 5, dpi = 300
+)
+```
+
+# 5. Filter proteins for statistical analysis
+
+Proteins are retained when at least three of four values are observed for **both** JAG1-ICD antibodies. Missingness in the IgG controls is allowed because proteins specifically enriched in the IP can be absent from the control.
+
+```{r filtering}
+S_cols <- grep("^S_R[1-4]$", names(dat), value = TRUE)
+TF_cols <- grep("^TF_R[1-4]$", names(dat), value = TRUE)
+IgG_cols <- grep("^IgG_R[1-4]$", names(dat), value = TRUE)
+
+filtered <- dat %>%
+  filter(
+    rowSums(!is.na(across(all_of(S_cols)))) >= 3,
+    rowSums(!is.na(across(all_of(TF_cols)))) >= 3
+  )
+
+write.table(
+  filtered,
+  file.path(results_dir, "data_filtered.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+nrow(filtered)
+```
+
+## QC after filtering
+
+```{r qc-filtered, fig.width=8, fig.height=5}
+qc_filtered <- make_qc_plots(filtered, "after filtering")
+
+qc_filtered$ids
+qc_filtered$density
+qc_filtered$boxplot
+```
+
+# 6. Missing-value imputation
+
+Missing IgG values are imputed in two steps:
+
+1. stochastic local similarity imputation (`imp4p::impute.slsa`) for MAR values;
+2. QRILC imputation (`imputeLCMD::impute.QRILC`) for remaining left-censored values.
+
+Values in the two JAG1-ICD IP groups are not artificially completed beyond the filtering criterion.
+
+```{r imputation}
+#| warning: false
+#| message: false
+
+igg <- as.matrix(filtered[, IgG_cols])
+conditions <- factor(rep("IgG", length(IgG_cols)))
+
+set.seed(123)
+
+igg_slsa <- imp4p::impute.slsa(igg, conditions)
+igg_imputed <- imputeLCMD::impute.QRILC(
+  igg_slsa,
+  tune.sigma = 1
+)[[1]]
+
+imputed <- filtered
+imputed[, IgG_cols] <- igg_imputed
+
+write.table(
+  imputed,
+  file.path(results_dir, "data_imputed.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+## QC after imputation
+
+```{r qc-imputed, fig.width=8, fig.height=5}
+qc_imputed <- make_qc_plots(imputed, "after imputation")
+
+qc_imputed$ids
+qc_imputed$density
+qc_imputed$boxplot
+```
+
+# 7. Median-centering normalization
+
+Systematic differences in signal intensity across samples are corrected using DAPAR `QuantileCentering`, with overall median centering.
+
+```{r normalization}
+sample_cols <- c(IgG_cols, S_cols, TF_cols)
+
+norm_matrix <- DAPAR::QuantileCentering(
+  imputed[, sample_cols],
+  conds = NULL,
+  type = "overall",
+  quantile = 0.5
+)
+
+norm <- imputed
+norm[, sample_cols] <- as.data.frame(norm_matrix)
+
+write.table(
+  norm,
+  file.path(results_dir, "data_normalized.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+## QC after normalization
+
+```{r qc-normalized, fig.width=8, fig.height=5}
+qc_norm <- make_qc_plots(norm, "after normalization")
+
+qc_norm$density
+qc_norm$boxplot
+```
+
+# 8. Principal component analysis
+
+PCA is performed on proteins quantified in all samples after normalization.
+
+```{r pca, fig.width=7, fig.height=5}
+complete_proteins <- complete.cases(norm[, sample_cols])
+
+pca <- prcomp(
+  t(as.matrix(norm[complete_proteins, sample_cols])),
+  center = TRUE,
+  scale. = FALSE
+)
+
+variance <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+pca_df <- as.data.frame(pca$x[, 1:2]) %>%
+  rownames_to_column("run") %>%
+  mutate(
+    group = str_remove(run, "_R.*$"),
+    replicate = str_extract(run, "R[1-4]$")
+  )
+
+p_pca <- ggplot(
+  pca_df,
+  aes(PC1, PC2, colour = group, shape = group, label = run)
+) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3, max.overlaps = Inf) +
+  labs(
+    x = paste0("PC1 (", round(variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(variance[2], 1), "%)")
+  ) +
+  theme_minimal(base_size = 12)
+
+p_pca
+
+ggsave(
+  file.path(plots_dir, "PCA_normalized_data.png"),
+  p_pca, width = 7, height = 5, dpi = 300
+)
+```
+
+# 9. Differential enrichment analysis with limma
+
+Each JAG1-ICD antibody is compared with IgG. Samples generated on the same experimental day are treated as repeated measures using `duplicateCorrelation`. Replicates R1/R2 belong to day 1 and R3/R4 to day 2.
+
+A no-intercept design and explicit contrasts are used here because they make the two comparisons unambiguous.
+
+```{r limma}
+sample_info <- tibble(
+  run = sample_cols,
+  condition = factor(
+    str_remove(sample_cols, "_R.*$"),
+    levels = c("IgG", "S", "TF")
+  ),
+  day = factor(
+    if_else(
+      str_detect(sample_cols, "R1|R2"),
+      "day1",
+      "day2"
+    )
+  )
+)
+
+design <- model.matrix(~ 0 + condition, data = sample_info)
+colnames(design) <- levels(sample_info$condition)
+
+expression_matrix <- as.matrix(norm[, sample_cols])
+
+corfit <- duplicateCorrelation(
+  expression_matrix,
+  design,
+  block = sample_info$day
+)
+
+fit <- lmFit(
+  expression_matrix,
+  design,
+  block = sample_info$day,
+  correlation = corfit$consensus
+)
+
+contrast_matrix <- makeContrasts(
+  S_vs_IgG = S - IgG,
+  TF_vs_IgG = TF - IgG,
+  levels = design
+)
+
+fit <- contrasts.fit(fit, contrast_matrix)
+fit <- eBayes(fit, trend = TRUE)
+
+tab_S <- topTable(
+  fit,
+  coef = "S_vs_IgG",
+  number = Inf,
+  sort.by = "none"
+) %>%
+  rename_with(~ paste0(.x, "_S"))
+
+tab_TF <- topTable(
+  fit,
+  coef = "TF_vs_IgG",
+  number = Inf,
+  sort.by = "none"
+) %>%
+  rename_with(~ paste0(.x, "_TF"))
+
+limma_results <- bind_cols(
+  filtered,
+  norm %>%
+    select(all_of(sample_cols)) %>%
+    rename_with(~ paste0(.x, "_norm")),
+  tab_S,
+  tab_TF
+)
+```
+
+# 10. Combine evidence from both antibodies
+
+P-values from the Sigma and Thermo Fisher comparisons are combined using Fisher's method and corrected for multiple testing using the Benjamini-Hochberg procedure.
+
+The combined fold-change metric is the mean of the two antibody-specific log2 fold changes.
+
+```{r combine-pvalues}
+limma_results <- limma_results %>%
+  rowwise() %>%
+  mutate(
+    p_combined = Tmisc::fisherp(c(P.Value_S, P.Value_TF)),
+    mean_log2FC = mean(c(logFC_S, logFC_TF), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_combined_BH = p.adjust(p_combined, method = "BH"),
+    Regulated = case_when(
+      mean_log2FC > 1 & p_combined_BH <= 0.05 ~ "Up-regulated",
+      mean_log2FC < -1 & p_combined_BH <= 0.05 ~ "Down-regulated",
+      TRUE ~ "Unchanged"
+    ),
+    S_status = case_when(
+      logFC_S > 1 & adj.P.Val_S <= 0.05 ~ "Up-regulated",
+      logFC_S < -1 & adj.P.Val_S <= 0.05 ~ "Down-regulated",
+      TRUE ~ "Unchanged"
+    ),
+    TF_status = case_when(
+      logFC_TF > 1 & adj.P.Val_TF <= 0.05 ~ "Up-regulated",
+      logFC_TF < -1 & adj.P.Val_TF <= 0.05 ~ "Down-regulated",
+      TRUE ~ "Unchanged"
+    )
+  )
+
+table(limma_results$Regulated)
+```
+
+# 11. Subcellular-location annotation
+
+Subcellular localization information was obtained from the Human Protein Atlas (HPA) Subcellular resource in 2025. Two complementary annotation sets were used: experimentally supported subcellular localization data and predicted localization data for membrane or secreted proteins lacking experimental subcellular localization information. The two datasets were combined to increase annotation coverage. For Spectronaut protein groups containing multiple UniProt accessions, the first accession was used for matching to the HPA annotation.
+
+```{r subcellular-location}
+loc_files <- file.path(
+  data_dir,
+  c("has_data_Subcellular.tsv", "NOT.tsv")
+)
+
+loc <- bind_rows(fread(loc_files[1]) %>% as.data.frame(),
+                 fread(loc_files[2]) %>% as.data.frame()) %>%
+  select(Uniprot, `Subcellular location`) %>%
+  distinct(Uniprot, .keep_all = TRUE)
+
+limma_results <- limma_results %>%
+  mutate(PG = str_remove(PG.ProteinGroups, ";.*$")) %>%
+  left_join(loc, by = c("PG" = "Uniprot"), relationship = "many-to-one")
+```
+
+# 12. Export final statistical results
+
+```{r export-results}
+write.table(
+  limma_results,
+  file.path(results_dir, "RIME_JAG1_HPAF_limma_results.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# 13. Volcano plots
+
+Antibody-specific volcano plots use the corresponding limma adjusted p-value and log2 fold change.
+
+```{r volcano-function}
+plot_volcano <- function(results, antibody = c("S", "TF"), top_n = 30) {
+  antibody <- match.arg(antibody)
+
+  fc_col <- paste0("logFC_", antibody)
+  padj_col <- paste0("adj.P.Val_", antibody)
+  status_col <- paste0(antibody, "_status")
+
+  labels <- results %>%
+    filter(.data[[status_col]] == "Up-regulated") %>%
+    arrange(.data[[padj_col]]) %>%
+    slice_head(n = top_n)
+
+  ggplot(
+    results,
+    aes(
+      x = .data[[fc_col]],
+      y = -log10(.data[[padj_col]]),
+      fill = .data[[status_col]]
+    )
+  ) +
+    geom_point(
+      size = 2.5,
+      shape = 21,
+      colour = "black",
+      alpha = 0.7
+    ) +
+    geom_text_repel(
+      data = labels,
+      aes(label = PG.Genes),
+      max.overlaps = Inf,
+      size = 3,
+      box.padding = 0.4
+    ) +
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dotted"
+    ) +
+    geom_vline(
+      xintercept = c(-1, 1),
+      linetype = "dotted"
+    ) +
+    labs(
+      x = paste0("Log2FC (", antibody, " - IgG)"),
+      y = "-Log10 adjusted p-value"
+    ) +
+    theme_light(base_size = 12)
+}
+```
+
+```{r volcano-plots, fig.width=7, fig.height=6}
+p_volcano_S <- plot_volcano(limma_results, "S", top_n = 30)
+p_volcano_TF <- plot_volcano(limma_results, "TF", top_n = 30)
+
+p_volcano_S
+p_volcano_TF
+
+ggsave(
+  file.path(plots_dir, "Volcano_Sigma_vs_IgG.png"),
+  p_volcano_S, width = 7, height = 6, dpi = 300
+)
+ggsave(
+  file.path(plots_dir, "Volcano_ThermoFisher_vs_IgG.png"),
+  p_volcano_TF, width = 7, height = 6, dpi = 300
+)
+```
+
+# 14. Heatmap of the combined JAG1-ICD interactome
+
+Proteins meeting the combined significance and fold-change criteria are displayed using row-scaled normalized intensities.
+
+```{r heatmap, fig.width=8, fig.height=10}
+interactors <- limma_results %>%
+  filter(Regulated == "Up-regulated") %>%
+  pull(PG.Genes) %>%
+  unique()
+
+hm <- norm %>%
+  filter(PG.Genes %in% interactors) %>%
+  select(PG.Genes, all_of(sample_cols))
+
+hm_genes <- make.unique(hm$PG.Genes)
+hm <- as.matrix(hm[, sample_cols])
+rownames(hm) <- hm_genes
+
+ph <- pheatmap(
+  hm,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 7,
+  silent = TRUE
+)
+
+print(ph)
+```
+
+# 15. Selected proteins
+
+Normalized abundance profiles are shown for JAG1 and selected candidate interactors.
+
+```{r selected-proteins, fig.width=6, fig.height=5}
+for (gene in c("JAG1", "TAOK3")) {
+  if (gene %in% norm$PG.Genes) {
+    p <- plot_target(norm, gene)
+    print(p)
+
+    ggsave(
+      file.path(plots_dir, paste0(gene, "_normalized_signal.png")),
+      p, width = 5, height = 4.5, dpi = 300
+    )
+  }
+}
+```
+
+# Session information
+
+Recording package and R versions makes the analysis easier to reproduce.
+
+```{r session-info}
+sessionInfo()
+```
