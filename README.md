@@ -37,7 +37,9 @@ The `results/` and `plots/` directories are generated locally during the analyse
 
 The mass spectrometry proteomics data and associated Spectronaut output files generated in this study have been deposited to the **ProteomeXchange Consortium** via the **PRIDE** partner repository (Deutsch et al., 2023; Perez-Riverol et al., 2022) with the dataset identifier:
 
-**PXDXXXXXX**
+**PXD083227**
+
+They will be publicly available upon publication of the associated manuscript.
 
 To reproduce the analyses, download the required Spectronaut output files from PRIDE and place them in the local `data/` directory.
 
